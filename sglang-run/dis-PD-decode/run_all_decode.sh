@@ -8,7 +8,7 @@
 #   2) P0 已 bash start_router.sh。
 #
 # ★与 dis-PD-prefill/run_all_pd.sh 的差异：
-#   1) 参数确认 grep 的是 enable_hisparse / nsa_decode_backend（而非 hicache），确认 hisparse 真开了；
+#   1) 参数确认 grep 的是 enable_hisparse / dsa_decode_backend（而非 hicache），确认 hisparse 真开了；
 #   2) SGL_SERVER_URL 指向 ★Decode head(30001)，让 metrics/profile 落 decode 侧；请求仍走 Router；
 #   3) 去掉 KV load 的 flush/命中率校准，改为透传 decode 压测参数（batch/max-tokens/input-len）；
 #   4) 保留 NIC 计数器基线（EP 通信量交叉验证仍有用）。
@@ -19,7 +19,8 @@
 #   bash run_all_decode.sh --profile --batch 32                    # 指定单组 batch
 #   bash run_all_decode.sh --profile --batch 8,16,32,64,128        # 扫 batch
 #   bash run_all_decode.sh --profile --batch 64 --max-tokens 512 --input-len 16384
-#   # A/B：off 组需在 D 侧用 HISPARSE=off NSA_DECODE_BACKEND=flashmla_sparse 重启后再跑，用 --tag 区分：
+#   # A/B：off 组需在 D 侧用 HISPARSE=off DSA_DECODE_BACKEND=flashmla_sparse 重启后再跑，用 --tag 区分：
+#   #      （FP8 权重的 off 基线改用 DSA_DECODE_BACKEND=flashmla_kv）
 #   bash run_all_decode.sh --profile --batch 64 --tag hs-on
 #   bash run_all_decode.sh --profile --batch 64 --tag hs-off
 
@@ -63,7 +64,7 @@ wait_health "router"  "http://127.0.0.1:${ROUTER_PORT}" || { echo "--- ${RLOG} -
 
 # ---------- 2) ★关键参数确认：hisparse 是否真的在 decode 侧生效 ----------
 echo "[check] Decode 生效参数（确认 hisparse 开启 + backend 对齐）："
-grep -oE 'enable_hisparse=(True|False)|hisparse_config=[^ ]+|nsa_decode_backend=.?[a-z_]+.?|attention_backend=.?[a-z]+.?|disaggregation_mode=.?[a-z]+.?|page_size=[0-9]+|max_running_requests=[0-9]+' \
+grep -oE 'enable_hisparse=(True|False)|hisparse_config=[^ ]+|dsa_decode_backend=.?[a-z_]+.?|nsa_decode_backend=.?[a-z_]+.?|attention_backend=.?[a-z]+.?|disaggregation_mode=.?[a-z]+.?|page_size=[0-9]+|max_running_requests=[0-9]+' \
     "${DLOG}" | sort -u | sed 's/^/  /' | head -20
 
 if grep -qE 'enable_hisparse=True' "${DLOG}" 2>/dev/null; then
@@ -74,8 +75,8 @@ else
     echo "         若你是在跑 A/B 的 OFF 基线组，请忽略本警告。"
 fi
 
-# 确认 decode 侧 backend（开 hisparse 会强制 flashmla_sparse）
-grep -oE 'flashmla_sparse' "${DLOG}" 2>/dev/null | head -1 | sed 's/^/  nsa backend: /' || true
+# 确认 decode 侧 backend（开 hisparse 时按 KV dtype 自动选：BF16->flashmla_sparse，FP8->flashmla_kv）
+grep -oE 'flashmla_sparse|flashmla_kv' "${DLOG}" 2>/dev/null | head -1 | sed 's/^/  dsa backend: /' || true
 
 # PD 分离特有：确认 KV 传输没有退化成 socket
 if grep -qiE 'fallback.*socket|socket.*fallback|transfer backend.*socket' "${DLOG}" "${PLOG}" 2>/dev/null; then

@@ -43,7 +43,7 @@ nohup python -m sglang.launch_server \
     --trust-remote-code \
     --tp 16 --dp 4 --enable-dp-attention \
     --ep-size 16 --moe-a2a-backend deepep \
-    --attention-backend nsa \
+    --attention-backend dsa \
     --nnodes 2 --node-rank "${NODE_RANK}" --dist-init-addr "${HEAD_ADDR}:5000" \
     --enable-hierarchical-cache \
     --hicache-ratio "${HICACHE_RATIO}" \

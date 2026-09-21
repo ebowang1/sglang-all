@@ -52,10 +52,12 @@
 #               也在默认流，前面还有 wait_stream(decode_producer_stream) 同步点。
 #     staging ：admit_request_into_staging 一次性全量 backup（每请求 1 次），
 #               走独立 write_staging_stream；collect_ready_reqs 里带 TP all_reduce(MIN)。
-#   ⚠️ 开启后会强制把 NSA backend 改为 flashmla_sparse（server_args.py:1450），
-#      且校验层拒绝其他 backend（server_args.py:6197）。因此做 A/B 对照时，
-#      基线组必须显式 NSA_DECODE_BACKEND=flashmla_sparse，否则测出来的是
-#      "backend 差异"而不是 "swap 开销"。
+#   ⚠️ 新版（DSA 架构）注意事项：
+#      1) 开启 hisparse 必须同时传 --disable-radix-cache（脚本已自动加），否则
+#         validate_hisparse 断言失败、进程起不来（arg_groups/hisparse_hook.py）。
+#      2) backend 按 KV dtype 自动二选一：BF16 -> flashmla_sparse，FP8(fp8_e4m3) -> flashmla_kv。
+#         做 A/B 对照时【不要】在 FP8 上硬写 flashmla_sparse（会 ValueError）；
+#         如需对齐基线，让脚本默认自动选，或用 DSA_DECODE_BACKEND 指定与 dtype 匹配的后端。
 #
 #   config 字段与默认值（mem_cache/sparsity/factory.py:_parse_sparse_config）：
 #     top_k                2048        每层取多少 token 参与 sparse attention
@@ -68,8 +70,9 @@
 #     HISPARSE=on bash start_server_pd.sh decode 0
 #     HISPARSE=on HISPARSE_TOPK=2048 HISPARSE_DEV_BUF=4096 bash start_server_pd.sh decode 0
 #     HISPARSE=on HISPARSE_CONFIG='{"top_k":512,"device_buffer_size":16384}' bash start_server_pd.sh decode 0
-#     # 基线组（不开 swap，但对齐 backend，用于纯净 A/B）：
-#     NSA_DECODE_BACKEND=flashmla_sparse bash start_server_pd.sh decode 0
+#     # 基线组（不开 swap，但对齐 backend，用于纯净 A/B；按 KV dtype 选对后端）：
+#     DSA_DECODE_BACKEND=flashmla_sparse bash start_server_pd.sh decode 0   # BF16 KV
+#     DSA_DECODE_BACKEND=flashmla_kv     bash start_server_pd.sh decode 0   # FP8  KV
 
 set -euo pipefail
 
@@ -103,7 +106,8 @@ SKIP_WARMUP="${SKIP_WARMUP:-0}"
 #   HISPARSE_DEV_BUF: device_buffer_size，默认 2*top_k（必须 >= top_k）
 #   HISPARSE_H2D    : host_to_device_ratio，默认 2
 #   HISPARSE_CONFIG : 直接给完整 JSON，给了则忽略上面三个分项
-#   NSA_DECODE_BACKEND / NSA_PREFILL_BACKEND: 显式指定 NSA backend（做纯净 A/B 用）
+#   DSA_DECODE_BACKEND / DSA_PREFILL_BACKEND: 显式指定 DSA backend（做纯净 A/B 用）
+#     （兼容旧名 NSA_DECODE_BACKEND / NSA_PREFILL_BACKEND）
 HISPARSE="${HISPARSE:-off}"
 HISPARSE_TOPK="${HISPARSE_TOPK:-2048}"
 HISPARSE_DEV_BUF="${HISPARSE_DEV_BUF:-}"
@@ -272,18 +276,24 @@ if [ "${ROLE}" = "decode" ] && [ "${HISPARSE}" = "on" ]; then
         fi
         HS_CFG="{\"top_k\":${HISPARSE_TOPK},\"device_buffer_size\":${HISPARSE_DEV_BUF},\"host_to_device_ratio\":${HISPARSE_H2D}}"
     fi
-    HISPARSE_ARGS=(--enable-hisparse --hisparse-config "${HS_CFG}")
-    HISPARSE_DESC="on cfg=${HS_CFG}"
+    HISPARSE_ARGS=(--enable-hisparse --hisparse-config "${HS_CFG}" --disable-radix-cache)
+    HISPARSE_DESC="on cfg=${HS_CFG} (+--disable-radix-cache)"
 fi
 
-# --- NSA backend 显式指定（做 hisparse A/B 时用于对齐基线）---
-# 不传则由 SGLang 自动选择；开 hisparse 时会被强制改为 flashmla_sparse。
-NSA_ARGS=()
-if [ -n "${NSA_DECODE_BACKEND:-}" ]; then
-    NSA_ARGS+=(--nsa-decode-backend "${NSA_DECODE_BACKEND}")
+# --- DSA backend 显式指定（做 hisparse A/B 时用于对齐基线）---
+# 不传则由 SGLang 按 KV dtype 自动选择：
+#   BF16 KV -> flashmla_sparse ；FP8(fp8_e4m3) KV -> flashmla_kv
+# ⚠️ 开 hisparse 时不要在 FP8 上硬写 flashmla_sparse，否则新版校验直接 ValueError。
+# 兼容：同时接受新变量 DSA_DECODE_BACKEND / DSA_PREFILL_BACKEND
+#       和旧变量 NSA_DECODE_BACKEND / NSA_PREFILL_BACKEND。
+DSA_ARGS=()
+DSA_DECODE_BACKEND="${DSA_DECODE_BACKEND:-${NSA_DECODE_BACKEND:-}}"
+DSA_PREFILL_BACKEND="${DSA_PREFILL_BACKEND:-${NSA_PREFILL_BACKEND:-}}"
+if [ -n "${DSA_DECODE_BACKEND}" ]; then
+    DSA_ARGS+=(--dsa-decode-backend "${DSA_DECODE_BACKEND}")
 fi
-if [ -n "${NSA_PREFILL_BACKEND:-}" ]; then
-    NSA_ARGS+=(--nsa-prefill-backend "${NSA_PREFILL_BACKEND}")
+if [ -n "${DSA_PREFILL_BACKEND}" ]; then
+    DSA_ARGS+=(--dsa-prefill-backend "${DSA_PREFILL_BACKEND}")
 fi
 
 echo "[start] role=${ROLE} node_rank=${NODE_RANK} dist-init=${HEAD}:5000 port=${PORT} -> ${LOG}"
@@ -297,8 +307,8 @@ if [ "${ROLE}" = "prefill" ]; then
 else
     echo "[start] hisparse=${HISPARSE_DESC}"
 fi
-if [ ${#NSA_ARGS[@]} -gt 0 ]; then
-    echo "[start] nsa: ${NSA_ARGS[*]}"
+if [ ${#DSA_ARGS[@]} -gt 0 ]; then
+    echo "[start] dsa: ${DSA_ARGS[*]}"
 fi
 
 nohup python -m sglang.launch_server \
@@ -306,7 +316,7 @@ nohup python -m sglang.launch_server \
     --trust-remote-code \
     --tp 16 --dp 4 --enable-dp-attention \
     --ep-size 16 --moe-a2a-backend deepep \
-    --attention-backend nsa \
+    --attention-backend dsa \
     --nnodes 2 --node-rank "${NODE_RANK}" --dist-init-addr "${HEAD}:5000" \
     --disaggregation-mode "${ROLE}" \
     --disaggregation-transfer-backend "${XFER_BACKEND}" \
@@ -316,7 +326,7 @@ nohup python -m sglang.launch_server \
     "${EXTRA_ARGS[@]}" \
     "${WARMUP_ARGS[@]}" \
     "${HISPARSE_ARGS[@]}" \
-    "${NSA_ARGS[@]}" \
+    "${DSA_ARGS[@]}" \
     --page-size 64 \
     --mem-fraction-static "${MEM_FRACTION}" \
     --enable-metrics \
@@ -334,7 +344,7 @@ echo "       bash \$(dirname \$0)/compile_deepgemm.sh <node_rank>"
 if [ "${ROLE}" = "decode" ]; then
     echo ""
     echo "[hint] hisparse A/B 对照（测 decode swap-in 与 EP low-latency 冲突）："
-    echo "       基线 A: NSA_DECODE_BACKEND=flashmla_sparse bash \$0 decode ${NODE_RANK}"
+    echo "       基线 A: DSA_DECODE_BACKEND=flashmla_sparse bash \$0 decode ${NODE_RANK}   # FP8 权重改用 flashmla_kv"
     echo "       实验 B: HISPARSE=on bash \$0 decode ${NODE_RANK}"
     echo "       扫变量: HISPARSE=on HISPARSE_DEV_BUF=16384 bash \$0 decode ${NODE_RANK}"
     echo "       ★A 组必须显式对齐 backend，否则测到的是 backend 差异而非 swap 开销"
