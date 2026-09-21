@@ -5,8 +5,20 @@ from transformers.configuration_utils import PreTrainedConfig
 from transformers.models.auto.configuration_auto import CONFIG_MAPPING
 
 try:
-    from huggingface_hub.dataclasses import strict
-except ImportError:  # older huggingface_hub
+    from huggingface_hub.dataclasses import strict as _hf_strict
+
+    def strict(cls):  # type: ignore[misc]
+        # Newer huggingface_hub (>=1.x) requires the target to already be a
+        # dataclass before @strict can be applied, otherwise it raises
+        # StrictDataclassDefinitionError. These transformers-based config
+        # classes are NOT dataclasses, so guard against that and degrade to a
+        # no-op decorator when strict cannot be applied.
+        try:
+            return _hf_strict(cls)
+        except Exception:
+            return cls
+
+except ImportError:  # older huggingface_hub without strict
 
     def strict(cls):  # type: ignore[misc]
         return cls
