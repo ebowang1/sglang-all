@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import abc
 import logging
+import mmap
 import threading
 from collections import defaultdict
 from dataclasses import dataclass
@@ -180,13 +181,25 @@ def get_allocator_from_storage(allocator_type):
 def _cuda_host_register(buffer: torch.Tensor) -> None:
     cudart = torch.cuda.cudart()
     n_bytes = buffer.numel() * buffer.element_size()
-    rc = cudart.cudaHostRegister(buffer.data_ptr(), n_bytes, 0)
+    ptr = buffer.data_ptr()
+
+    # cudaHostRegister requires the registered region to be page-aligned in BOTH
+    # base address and length. HiSparse's host KV pool comes from alloc_mmap(), whose
+    # base ptr is page-aligned but whose logical size can have a sub-page remainder
+    # (e.g. 23358806016 % 4096 == 512). Passing such a size makes cudaHostRegister
+    # return cudaErrorInvalidValue (rc=1, "invalid argument"). alloc_mmap() itself
+    # rounds the *allocation* up to a whole number of pages, so rounding the register
+    # length up to the page boundary stays within the mapped region and is safe.
+    pagesize = mmap.PAGESIZE
+    reg_bytes = ((n_bytes + pagesize - 1) // pagesize) * pagesize
+
+    rc = cudart.cudaHostRegister(ptr, reg_bytes, 0)
     if int(rc) != 0:
         raise RuntimeError(
             f"cudaHostRegister failed (rc={int(rc)}, "
-            f"{cudart.cudaGetErrorString(rc)}) for ptr={buffer.data_ptr():#x} "
-            f"size={n_bytes}; host buffer is not pinned and device transfers "
-            f"may silently return stale data."
+            f"{cudart.cudaGetErrorString(rc)}) for ptr={ptr:#x} "
+            f"size={n_bytes} (page-rounded={reg_bytes}); host buffer is not pinned "
+            f"and device transfers may silently return stale data."
         )
 
 

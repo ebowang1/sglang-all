@@ -15,6 +15,135 @@ FetchContent_Declare(
 )
 FetchContent_Populate(repo-flashmla-cutlass)
 
+# ---------------------------------------------------------------------------
+# PATCH: guard sm100 references in csrc/api/sparse_decode.h behind
+# #ifdef FLASHMLA_ENABLE_SM100.
+#
+# Why: sparse_decode.h unconditionally #includes sm100 kernel headers and, in its
+# runtime arch-dispatch, references sm100-only symbols such as
+# run_flash_splitkv_mla_fp8_sparse_kernel. On CUDA 12.8 we keep SM100 OFF because
+# 12.8's ptxas cannot assemble those Blackwell kernels
+# (model1.compute_100a.ptx: "Multiple cache eviction priority modifiers" /
+#  "Vector type too large, exceeds 128 bit"). With SM100 OFF the sm100 .cu files are
+# not compiled, yet the header still emitted references to their symbols -> the built
+# flashmla_ops.abi3.so had an UNDEFINED sm100 symbol -> `import flashmla_ops` crashed
+# at load (scheduler exit -3) -> HiSparse decode failed.
+#
+# Guarding the sm100 code paths removes those references when SM100 is OFF. H20 (sm90)
+# only ever takes the is_sm90a() branch at runtime, so functionality is unaffected.
+# When SM100 is ON (CUDA 13+), the guards are no-ops and sm100 stays enabled.
+# Idempotent: the marker prevents double patching across re-configures.
+# ---------------------------------------------------------------------------
+set(_sd "${repo-flashmla_SOURCE_DIR}/csrc/api/sparse_decode.h")
+if(EXISTS "${_sd}")
+    file(READ "${_sd}" _sd_content)
+    string(FIND "${_sd_content}" "FLASHMLA_ENABLE_SM100_GUARD_APPLIED" _sd_marker)
+    if(_sd_marker EQUAL -1)
+        message(STATUS "[flashmla-patch] guarding sm100 refs in sparse_decode.h")
+
+        # 1) guard the two sm100 includes
+        string(REPLACE
+            "#include \"sm100/decode/head64/kernel.h\""
+            "#ifdef FLASHMLA_ENABLE_SM100\n#include \"sm100/decode/head64/kernel.h\"\n#endif"
+            _sd_content "${_sd_content}")
+        string(REPLACE
+            "#include \"sm100/prefill/sparse/fwd_for_small_topk/head128/phase1.h\""
+            "#ifdef FLASHMLA_ENABLE_SM100\n#include \"sm100/prefill/sparse/fwd_for_small_topk/head128/phase1.h\"\n#endif"
+            _sd_content "${_sd_content}")
+
+        # 2) guard the sm100 impl classes (open before the 1st, close after the 3rd).
+        #    The 3rd/last sm100 class is Decode_Sm100_Head128_Impl; it ends with "};"
+        #    immediately followed by the free function sparse_attn_decode_interface().
+        #    Open the guard before the 1st class and close it right before that function.
+        string(REPLACE
+            "class Decode_Sm100_Head64_Impl : public DecodeImplBase {"
+            "#ifdef FLASHMLA_ENABLE_SM100\nclass Decode_Sm100_Head64_Impl : public DecodeImplBase {"
+            _sd_content "${_sd_content}")
+        string(REPLACE
+            "static std::tuple<at::Tensor, at::Tensor, std::optional<at::Tensor>, std::optional<at::Tensor>>\nsparse_attn_decode_interface("
+            "#endif  // FLASHMLA_ENABLE_SM100 (impl classes)\nstatic std::tuple<at::Tensor, at::Tensor, std::optional<at::Tensor>, std::optional<at::Tensor>>\nsparse_attn_decode_interface("
+            _sd_content "${_sd_content}")
+
+        # 3) guard the dispatch sm100 branch and demote "} else if" -> "if" so sm90
+        #    remains reachable when sm100 is compiled out.
+        string(REPLACE
+            "    DecodeImplBase* impl;\n    if (arch.is_sm100f()) {"
+            "    DecodeImplBase* impl;\n#ifdef FLASHMLA_ENABLE_SM100\n    if (arch.is_sm100f()) {"
+            _sd_content "${_sd_content}")
+        # NOTE: keep the closing brace of the is_sm100f() block. The original text is
+        #   "    } else if (arch.is_sm90a()) {"
+        # where the leading "}" closes `if (arch.is_sm100f())`. When we guard the sm100
+        # branch out we must PRESERVE that "}" and turn the "else if" into a plain "if",
+        # otherwise is_sm100f()'s block would be left unclosed.
+        string(REPLACE
+            "    } else if (arch.is_sm90a()) {"
+            "    }\n#endif  // FLASHMLA_ENABLE_SM100 (dispatch)\n    if (arch.is_sm90a()) {"
+            _sd_content "${_sd_content}")
+
+        # marker at very top
+        set(_sd_content "// FLASHMLA_ENABLE_SM100_GUARD_APPLIED\n${_sd_content}")
+        file(WRITE "${_sd}" "${_sd_content}")
+        message(STATUS "[flashmla-patch] done")
+    else()
+        message(STATUS "[flashmla-patch] already patched, skip")
+    endif()
+else()
+    message(WARNING "[flashmla-patch] sparse_decode.h not found at ${_sd}")
+endif()
+
+# ---------------------------------------------------------------------------
+# Same guard for csrc/api/sparse_fwd.h (prefill side). It unconditionally includes
+# sm100 prefill headers and references sm100::fwd::head{64,128}::run_fwd_phase1_kernel
+# / sm100::fwd_for_small_topk. Same undefined-symbol crash as sparse_decode.h when
+# SM100 is OFF. Guard includes + the 3 Fwd_Sm100_* classes + the is_sm100f() dispatch.
+# ---------------------------------------------------------------------------
+set(_sf "${repo-flashmla_SOURCE_DIR}/csrc/api/sparse_fwd.h")
+if(EXISTS "${_sf}")
+    file(READ "${_sf}" _sf_content)
+    string(FIND "${_sf_content}" "FLASHMLA_ENABLE_SM100_GUARD_APPLIED" _sf_marker)
+    if(_sf_marker EQUAL -1)
+        message(STATUS "[flashmla-patch] guarding sm100 refs in sparse_fwd.h")
+
+        # 1) guard the 3 sm100 includes (wrap the contiguous block: open before the
+        #    first sm100 include, close after the last one).
+        string(REPLACE
+            "#include \"sm100/prefill/sparse/fwd/head128/phase1.h\"\n#include \"sm100/prefill/sparse/fwd/head64/phase1.h\"\n#include \"sm100/prefill/sparse/fwd_for_small_topk/head128/phase1.h\""
+            "#ifdef FLASHMLA_ENABLE_SM100\n#include \"sm100/prefill/sparse/fwd/head128/phase1.h\"\n#include \"sm100/prefill/sparse/fwd/head64/phase1.h\"\n#include \"sm100/prefill/sparse/fwd_for_small_topk/head128/phase1.h\"\n#endif"
+            _sf_content "${_sf_content}")
+
+        # 2) guard the 3 sm100 impl classes: open before Fwd_Sm100_Head64_Impl,
+        #    close right before the free function sparse_attn_prefill_interface().
+        string(REPLACE
+            "class Fwd_Sm100_Head64_Impl : public FwdImplBase {"
+            "#ifdef FLASHMLA_ENABLE_SM100\nclass Fwd_Sm100_Head64_Impl : public FwdImplBase {"
+            _sf_content "${_sf_content}")
+        string(REPLACE
+            "static std::vector<at::Tensor> sparse_attn_prefill_interface("
+            "#endif  // FLASHMLA_ENABLE_SM100 (fwd impl classes)\nstatic std::vector<at::Tensor> sparse_attn_prefill_interface("
+            _sf_content "${_sf_content}")
+
+        # 3) guard the is_sm100f() dispatch branch. Structure is:
+        #      if (is_sm90a) { ... } else if (is_sm100f) { ... } else { throw }
+        #    Keep the "}" that closes the is_sm90a block, guard the middle branch out.
+        string(REPLACE
+            "    } else if (is_sm100f) {"
+            "    }\n#ifdef FLASHMLA_ENABLE_SM100\n    else if (is_sm100f) {"
+            _sf_content "${_sf_content}")
+        string(REPLACE
+            "    } else {\n        TORCH_CHECK(false, \"Unsupported architecture\");"
+            "    }\n#endif  // FLASHMLA_ENABLE_SM100 (fwd dispatch)\n    else {\n        TORCH_CHECK(false, \"Unsupported architecture\");"
+            _sf_content "${_sf_content}")
+
+        set(_sf_content "// FLASHMLA_ENABLE_SM100_GUARD_APPLIED\n${_sf_content}")
+        file(WRITE "${_sf}" "${_sf_content}")
+        message(STATUS "[flashmla-patch] sparse_fwd.h done")
+    else()
+        message(STATUS "[flashmla-patch] sparse_fwd.h already patched, skip")
+    endif()
+else()
+    message(WARNING "[flashmla-patch] sparse_fwd.h not found at ${_sf}")
+endif()
+
 set(FLASHMLA_CUDA_FLAGS
     "--expt-relaxed-constexpr"
     "--expt-extended-lambda"
@@ -33,6 +162,13 @@ if(${CUDA_VERSION} VERSION_GREATER 12.4)
         "-gencode=arch=compute_90a,code=sm_90a"
     )
 endif()
+# NOTE: keep SM100 OFF on CUDA 12.8. The sm100 sparse-decode kernels use Blackwell
+# PTX features that CUDA 12.8's ptxas cannot assemble (verified: `model1.compute_100a.ptx
+# ... Multiple cache eviction priority modifiers / Vector type too large, exceeds 128 bit`).
+# They require CUDA 13+ (hence the original strict `> 12.8`). To make HiSparse decode work
+# on this 12.8 box we instead guard the sm100 references in
+# csrc/api/sparse_decode.h with #ifdef FLASHMLA_ENABLE_SM100 so the .so no longer has an
+# undefined sm100 symbol; H20 only uses the sm90 path at runtime anyway.
 if(${CUDA_VERSION} VERSION_GREATER 12.8)
     list(APPEND FLASHMLA_CUDA_FLAGS
         "-gencode=arch=compute_100a,code=sm_100a"

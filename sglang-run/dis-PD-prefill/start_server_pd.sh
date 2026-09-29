@@ -296,6 +296,20 @@ if [ -n "${DSA_PREFILL_BACKEND}" ]; then
     DSA_ARGS+=(--dsa-prefill-backend "${DSA_PREFILL_BACKEND}")
 fi
 
+# --- ★KV cache dtype（决定 hisparse 自动选哪个 DSA backend）---
+#   背景：hisparse 按 KV dtype 选 backend：BF16 -> flashmla_sparse，FP8(fp8_e4m3) -> flashmla_kv。
+#   本环境自编的 sgl-kernel(flashmla_ops.abi3.so) 缺 FP8 sparse decode 符号
+#   (run_flash_splitkv_mla_fp8_sparse_kernel undefined)，因此 flashmla_sparse 路径会
+#   在 decode 时 ImportError 崩溃(scheduler exit -3)。
+#   对 GLM-5-FP8 用 KV_DTYPE=fp8_e4m3 让 hisparse 走 flashmla_kv(符号齐全)即可绕开。
+#   默认空 = 不传(保持 SGLang 默认 auto)。
+#   例：HISPARSE=on KV_DTYPE=fp8_e4m3 bash start_server_pd.sh decode 0
+KV_DTYPE="${KV_DTYPE:-}"
+KV_DTYPE_ARGS=()
+if [ -n "${KV_DTYPE}" ]; then
+    KV_DTYPE_ARGS=(--kv-cache-dtype "${KV_DTYPE}")
+fi
+
 echo "[start] role=${ROLE} node_rank=${NODE_RANK} dist-init=${HEAD}:5000 port=${PORT} -> ${LOG}"
 echo "[start] mem-fraction=${MEM_FRACTION} hicache=${HICACHE}(ratio=${HICACHE_RATIO})"
 echo "[start] pd: backend=${XFER_BACKEND} ib=${IB_DEV} bootstrap=${BOOTSTRAP_PORT}"
@@ -309,6 +323,9 @@ else
 fi
 if [ ${#DSA_ARGS[@]} -gt 0 ]; then
     echo "[start] dsa: ${DSA_ARGS[*]}"
+fi
+if [ -n "${KV_DTYPE}" ]; then
+    echo "[start] kv-cache-dtype=${KV_DTYPE}"
 fi
 
 nohup python -m sglang.launch_server \
@@ -327,6 +344,7 @@ nohup python -m sglang.launch_server \
     "${WARMUP_ARGS[@]}" \
     "${HISPARSE_ARGS[@]}" \
     "${DSA_ARGS[@]}" \
+    "${KV_DTYPE_ARGS[@]}" \
     --page-size 64 \
     --mem-fraction-static "${MEM_FRACTION}" \
     --enable-metrics \
